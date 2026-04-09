@@ -4514,6 +4514,8 @@ class DownloadListFrame(ctk.CTkFrame):
         self._page_num_entry.pack(expand=True, padx=4, pady=2)
         self._page_num_entry.bind("<Return>", lambda _e: self._commit_page_entry())
         self._page_num_entry.bind("<FocusOut>", lambda _e: self._commit_page_entry())
+        self._page_num_entry.bind("<FocusIn>", self._on_page_entry_focus_in)
+        self._page_num_entry.bind("<KeyRelease>", self._on_page_entry_key_release)
         self._page_total_suffix = ctk.CTkLabel(
             nav, text=self._tr_local("page_suffix", total=1), font=ctk.CTkFont(family="Microsoft YaHei", size=12), text_color="#555"
         )
@@ -4579,6 +4581,9 @@ class DownloadListFrame(ctk.CTkFrame):
         self._thumb_enqueued = set()
         self._thumb_worker_started = False
         self._RIGHT_LIST_THUMB_STAGGER_MS = 180
+        # 分页输入保护：用户点入输入框后短时间内不被自动回填当前页，避免输入 "15" 时被中途改写。
+        self._page_entry_protect_until = 0.0
+        self._PAGE_ENTRY_PROTECT_MS = 2500
 
         self.update_button_states()
         self._refresh_batch_action_buttons()
@@ -4736,7 +4741,28 @@ class DownloadListFrame(ctk.CTkFrame):
         if p < 1 or p > tp:
             return
         self._current_page = p - 1
+        self._page_entry_protect_until = 0.0
         self.render_current_page()
+
+    def _is_page_entry_under_user_protection(self):
+        try:
+            if not hasattr(self, "_page_num_entry") or not self._page_num_entry.winfo_exists():
+                return False
+            if self._page_num_entry.focus_get() == self._page_num_entry:
+                return True
+        except Exception:
+            pass
+        return time.monotonic() < float(getattr(self, "_page_entry_protect_until", 0.0))
+
+    def _arm_page_entry_protection(self):
+        ms = int(getattr(self, "_PAGE_ENTRY_PROTECT_MS", 2500))
+        self._page_entry_protect_until = time.monotonic() + max(0.1, ms / 1000.0)
+
+    def _on_page_entry_focus_in(self, _event):
+        self._arm_page_entry_protection()
+
+    def _on_page_entry_key_release(self, _event):
+        self._arm_page_entry_protection()
 
     def _page_index_for_first_processing_video(self):
         """当前队列中最靠前「正在处理」的视频所在页（0-based 页索引）。"""
@@ -4802,13 +4828,15 @@ class DownloadListFrame(ctk.CTkFrame):
         if self._current_page >= tp:
             self._current_page = max(0, tp - 1)
         n = len(self._video_order)
+        preserve_entry = self._is_page_entry_under_user_protection()
         self._page_nav_programmatic = True
         try:
-            try:
-                self._page_num_entry.delete(0, "end")
-                self._page_num_entry.insert(0, str(self._current_page + 1))
-            except Exception:
-                pass
+            if not preserve_entry:
+                try:
+                    self._page_num_entry.delete(0, "end")
+                    self._page_num_entry.insert(0, str(self._current_page + 1))
+                except Exception:
+                    pass
             self._page_total_suffix.configure(text=self._tr_local("page_suffix", total=tp))
             self._page_count_label.configure(text=self._tr_local("page_total_items", count=n))
         finally:
