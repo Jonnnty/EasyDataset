@@ -1508,10 +1508,21 @@ class TaskManager:
     def save_task_messages(self, task_id, messages):
         task_path = os.path.join(self.tasks_path, task_id)
         messages_path = os.path.join(task_path, "messages.json")
+        if not os.path.isdir(task_path):
+            return
         tmp_path = messages_path + ".tmp"
-        with open(tmp_path, 'w', encoding='utf-8') as f:
-            json.dump(messages, f, ensure_ascii=False, indent=2)
-        os.replace(tmp_path, messages_path)
+        try:
+            with open(tmp_path, 'w', encoding='utf-8') as f:
+                json.dump(messages, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, messages_path)
+        except FileNotFoundError:
+            # 任务可能在后台回调期间被删除：静默跳过，避免 Tk 回调异常打断主循环
+            try:
+                if os.path.isfile(tmp_path):
+                    os.remove(tmp_path)
+            except OSError:
+                pass
+            return
 
     def update_task_info(self, task_id, updates):
         with self._task_info_lock:
@@ -1536,6 +1547,11 @@ class TaskManager:
                     break
 
     def delete_task(self, task_id):
+        # 删除任务时必须关闭该任务浏览器，避免后台线程继续复用并新开实例
+        try:
+            TaskBrowserManager(task_id).close_task_drivers()
+        except Exception:
+            pass
         TaskBrowserManager.detach_task_without_closing_browser(task_id)
         task_path = os.path.join(self.tasks_path, task_id)
         if os.path.exists(task_path):
@@ -4961,6 +4977,12 @@ class DownloadListFrame(ctk.CTkFrame):
             self.is_processing_queue = True
 
             try:
+                # 任务已删除：立即清空队列并退出，阻止继续开浏览器/起提取线程
+                if self.task_manager.get_task(self.task_id) is None:
+                    self.extraction_queue.clear()
+                    self.active_extractions.clear()
+                    _resume_flow_dbg("_process_queue.return_task_deleted", f"task={self.task_id}")
+                    return
                 if self.task_manager.is_task_paused(self.task_id):
                     _resume_flow_dbg("_process_queue.return_paused", f"task={self.task_id}")
                     return
@@ -5620,10 +5642,12 @@ class TaskItemFrame(ctk.CTkFrame):
                                      self.app.tr("delete_task_confirm", name=self.task['name']),
                                      icon='warning')
         if result:
-            self.app.cancel_task_workers(self.task['task_id'])
-            self.app.task_manager.delete_task(self.task['task_id'])
+            tid = self.task['task_id']
+            self.app.cancel_task_workers(tid)
+            self.app.task_manager.delete_task(tid)
+            self.app._cleanup_deleted_task_runtime(tid)
             self.app.load_tasks_to_sidebar()
-            if self.app.current_task_id == self.task['task_id']:
+            if self.app.current_task_id == tid:
                 if self.app.task_manager.tasks:
                     self.app.switch_task(self.app.task_manager.tasks[0]['task_id'])
                 else:
@@ -6046,8 +6070,44 @@ class EasyDatasetApp(ctk.CTk):
 
     def cancel_task_workers(self, task_id):
         TaskThreadManager.cancel_task(task_id)
+        try:
+            TaskBrowserManager(task_id).close_task_drivers()
+        except Exception:
+            pass
         if task_id in self.task_download_frames:
             self.task_download_frames[task_id].stop_all_threads_for_delete_task()
+
+    def _is_task_alive(self, task_id):
+        return bool(task_id) and (self.task_manager.get_task(task_id) is not None)
+
+    def _cleanup_deleted_task_runtime(self, task_id):
+        if not task_id:
+            return
+        try:
+            df = self.task_download_frames.pop(task_id, None)
+            if df is not None:
+                try:
+                    df.stop_all_threads_for_delete_task()
+                except Exception:
+                    pass
+                try:
+                    df.grid_remove()
+                    df.destroy()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            w = self.task_widgets.pop(task_id, None)
+            if w and w.get("msg_area") is not None:
+                try:
+                    w["msg_area"].grid_remove()
+                    w["msg_area"].destroy()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        self.task_states.pop(task_id, None)
 
     def on_recommendation_flow_toggle_click(self):
         """底部推荐控制条已移除；保留空实现避免旧绑定报错。"""
@@ -8053,6 +8113,9 @@ class EasyDatasetApp(ctk.CTk):
 
         def process_keywords():
             nonlocal seen_video_ids
+            if not self._is_task_alive(task_id):
+                self.after(0, lambda tid=task_id: self._finish_recommendation_flow(tid))
+                return
             seen_video_ids |= self._collect_all_seen_video_ids_for_task(task_id)
             total_analyzed = 0
             total_matched = 0
@@ -8213,10 +8276,15 @@ class EasyDatasetApp(ctk.CTk):
 
             def start_recursive_recommend():
                 try:
+                    if not self._is_task_alive(task_id):
+                        return
                     dl_frame = self.task_download_frames.get(task_id)
                     if not dl_frame:
                         return
-                    target = self.task_manager.get_task(task_id).get('target_video_count') or target_count
+                    task_obj = self.task_manager.get_task(task_id)
+                    if not task_obj:
+                        return
+                    target = task_obj.get('target_video_count') or target_count
                     current_total = len(getattr(dl_frame, "_video_order", []) or [])
                     if not target or current_total >= target:
                         return
@@ -8232,6 +8300,8 @@ class EasyDatasetApp(ctk.CTk):
     def _recursive_sidebar_recommend(self, task_id, user_request, preferences, target_count, current_count,
                                      max_depth=5):
         """多轮抓取：对一次推荐+二次推荐得到的视频，循环抓取其侧边栏推荐作为三次、四次..."""
+        if not self._is_task_alive(task_id):
+            return
         self.after(0, lambda x=task_id, tc=target_count, cc=current_count: self.update_status_message(
             f"🔁 开始多轮推荐抓取（目标还差 {max(0, tc - cc)} 个）", task_id=x))
 
@@ -8250,6 +8320,8 @@ class EasyDatasetApp(ctk.CTk):
         total_matched = 0
 
         while queue and self._current_download_total_for_task(task_id) < target_count:
+            if not self._is_task_alive(task_id):
+                break
             TaskThreadManager.wait_recommendation_running(task_id)
             if TaskThreadManager.is_task_cancelled(task_id):
                 break
@@ -8285,6 +8357,8 @@ class EasyDatasetApp(ctk.CTk):
                 continue
 
             for rec_v in recommended:
+                if not self._is_task_alive(task_id):
+                    return
                 TaskThreadManager.wait_recommendation_running(task_id)
                 if TaskThreadManager.is_task_cancelled(task_id):
                     return
@@ -8765,6 +8839,8 @@ class EasyDatasetApp(ctk.CTk):
         tid = task_id if task_id is not None else self.current_task_id
         if not tid:
             return
+        if not self._is_task_alive(tid):
+            return
         if tid == self.current_task_id:
             if self.get_current_status_frame() is not None:
                 self.clear_status_message(tid)
@@ -8776,7 +8852,10 @@ class EasyDatasetApp(ctk.CTk):
         messages = list(state.get("current_messages") or [])
         messages.append(m)
         state["current_messages"] = messages
-        self.task_manager.save_task_messages(tid, messages)
+        try:
+            self.task_manager.save_task_messages(tid, messages)
+        except FileNotFoundError:
+            return
         if tid == self.current_task_id:
             self.current_messages = messages
         msg_area = self.get_msg_area_for_task(tid)
