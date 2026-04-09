@@ -556,6 +556,11 @@ I18N = {
         "download_list_title": "📥 帧提取列表",
         "btn_pause_download": "⏸️ 暂停下载",
         "btn_resume_download": "▶️ 继续下载",
+        "btn_batch_redownload": "重新下载",
+        "btn_batch_delete": "删除",
+        "batch_no_selection_title": "未选择视频",
+        "batch_no_selection_text": "请先勾选要处理的视频。",
+        "batch_delete_confirm": "确定要删除已勾选的 {count} 个视频吗？\n\n已提取的帧也会被删除。",
         "count_recorded": "已记录，目标视频数量: {count} 个，开始搜索...",
         "count_recorded_no_n": "已记录，开始搜索...",
         "video_keyword_prefix": "关键词：",
@@ -600,6 +605,11 @@ I18N = {
         "download_list_title": "📥 Frame Extraction List",
         "btn_pause_download": "⏸️ Pause Download",
         "btn_resume_download": "▶️ Resume Download",
+        "btn_batch_redownload": "Redownload",
+        "btn_batch_delete": "Delete",
+        "batch_no_selection_title": "No videos selected",
+        "batch_no_selection_text": "Select videos first.",
+        "batch_delete_confirm": "Delete {count} selected videos?\n\nExtracted frames will also be deleted.",
         "count_recorded": "Saved. Target video count: {count}. Starting search...",
         "count_recorded_no_n": "Saved. Starting search...",
         "video_keyword_prefix": "Keyword: ",
@@ -4251,10 +4261,11 @@ class _HoverTitleTooltip:
 class FrameGridCell(ctk.CTkFrame):
     """单格：封面在上，标题与状态在下；时长叠在封面上。"""
 
-    def __init__(self, parent, list_frame, video_id, title="", duration="", **kwargs):
+    def __init__(self, parent, list_frame, video_id, title="", duration="", checked=False, on_checked_change=None, **kwargs):
         super().__init__(parent, corner_radius=6, fg_color="#ffffff", border_width=1, border_color="#e6e6e6", **kwargs)
         self.list_frame = list_frame
         self.video_id = video_id
+        self.on_checked_change = on_checked_change
         self._thumb_label = None
         tw = 120
         th = 68
@@ -4289,6 +4300,23 @@ class FrameGridCell(ctk.CTkFrame):
         )
         self._dur_overlay.place(relx=0.98, rely=0.98, anchor="se")
         self._dur_overlay.lift()
+        # 批量操作复选框：默认空勾选，用户可按页批量删除/重下
+        self._batch_check_var = ctk.BooleanVar(value=bool(checked))
+        self._batch_check = ctk.CTkCheckBox(
+            self.thumb_slot,
+            text="",
+            variable=self._batch_check_var,
+            width=18,
+            height=18,
+            checkbox_width=16,
+            checkbox_height=16,
+            fg_color="#165DFF",
+            border_color="#b8b8b8",
+            hover_color="#0E42D2",
+            command=self._on_batch_check_changed,
+        )
+        self._batch_check.place(relx=0.03, rely=0.05, anchor="nw")
+        self._batch_check.lift()
         # 下：标题（悬停可看全文）
         self.title_lbl = ctk.CTkLabel(
             self,
@@ -4313,17 +4341,17 @@ class FrameGridCell(ctk.CTkFrame):
             justify="left",
         )
         self.status_lbl.pack(fill="x", padx=5, pady=(0, 4))
-        self.bind("<Button-3>", self._menu)
-        self.thumb_slot.bind("<Button-3>", self._menu)
-        self._thumb_inner.bind("<Button-3>", self._menu)
-        self.status_lbl.bind("<Button-3>", self._menu)
-        self.title_lbl.bind("<Button-3>", self._menu)
-        self._dur_overlay.bind("<Button-3>", self._menu)
-
-    def _menu(self, event):
-        item = self.list_frame.download_items.get(self.video_id)
-        if item:
-            item.show_context_menu(event)
+    def _on_batch_check_changed(self):
+        if self.on_checked_change:
+            try:
+                self.on_checked_change(self.video_id, bool(self._batch_check_var.get()))
+            except Exception:
+                pass
+    def set_checked(self, checked):
+        try:
+            self._batch_check_var.set(bool(checked))
+        except Exception:
+            pass
 
     def set_status_text(self, text):
         raw = (text or "").strip()
@@ -4392,6 +4420,7 @@ class DownloadListFrame(ctk.CTkFrame):
         self._video_order = []
         self._current_page = 0
         self._page_cells = {}
+        self._batch_selected_video_ids = set()
         self.extraction_queue = []
         self.active_extractions = set()
         # 须用 RLock：_process_queue 在持锁时可能经 restore_from_cache→update_status→update_count_display
@@ -4502,6 +4531,38 @@ class DownloadListFrame(ctk.CTkFrame):
             command=self._go_next_page,
         )
         self._next_page_btn.pack(side="left", padx=8)
+        # 跨页勾选后统一处理：白底无边框，与浅灰背景接近；无勾选灰字不可点，有勾选蓝/红字可点
+        _is_en = self._app and getattr(self._app, "lang", "zh") == "en"
+        self.batch_delete_btn = ctk.CTkButton(
+            nav,
+            text=self._tr_local("btn_batch_delete"),
+            width=(64 if _is_en else 44),
+            height=28,
+            font=ctk.CTkFont(family="Microsoft YaHei", size=12, weight="bold"),
+            fg_color="#ffffff",
+            hover_color="#ffffff",
+            text_color="#999999",
+            text_color_disabled="#999999",
+            border_width=0,
+            corner_radius=4,
+            command=self.batch_delete_selected,
+        )
+        self.batch_delete_btn.pack(side="right", padx=(4, 0))
+        self.batch_redownload_btn = ctk.CTkButton(
+            nav,
+            text=self._tr_local("btn_batch_redownload"),
+            width=(96 if _is_en else 72),
+            height=28,
+            font=ctk.CTkFont(family="Microsoft YaHei", size=12, weight="bold"),
+            fg_color="#ffffff",
+            hover_color="#ffffff",
+            text_color="#999999",
+            text_color_disabled="#999999",
+            border_width=0,
+            corner_radius=4,
+            command=self.batch_redownload_selected,
+        )
+        self.batch_redownload_btn.pack(side="right", padx=(8, 0))
 
         self._grid_scroll = ctk.CTkScrollableFrame(
             self.content_frame, fg_color="#eeeeee", corner_radius=8, orientation="vertical"
@@ -4520,6 +4581,7 @@ class DownloadListFrame(ctk.CTkFrame):
         self._RIGHT_LIST_THUMB_STAGGER_MS = 180
 
         self.update_button_states()
+        self._refresh_batch_action_buttons()
         self._update_page_nav_ui()
 
     def _total_pages(self):
@@ -4536,6 +4598,128 @@ class DownloadListFrame(ctk.CTkFrame):
         if self._current_page < tp - 1:
             self._current_page += 1
             self.render_current_page()
+
+    def _set_video_batch_checked(self, video_id, checked):
+        if checked:
+            self._batch_selected_video_ids.add(video_id)
+        else:
+            self._batch_selected_video_ids.discard(video_id)
+        self._refresh_batch_action_buttons()
+
+    def _selected_ids_on_current_page(self):
+        start = self._current_page * self.PAGE_SIZE
+        cur_ids = set(self._video_order[start:start + self.PAGE_SIZE])
+        return [vid for vid in self._video_order[start:start + self.PAGE_SIZE] if vid in self._batch_selected_video_ids and vid in cur_ids]
+
+    def _selected_ids_all_pages(self):
+        order_set = set(self._video_order)
+        return [vid for vid in self._video_order if vid in self._batch_selected_video_ids and vid in order_set]
+
+    def _refresh_batch_action_buttons(self):
+        if not hasattr(self, "batch_redownload_btn") or not hasattr(self, "batch_delete_btn"):
+            return
+        has_selected = bool(self._selected_ids_all_pages())
+        if has_selected:
+            self.batch_redownload_btn.configure(
+                state="normal",
+                fg_color="#ffffff",
+                hover_color="#e8f0ff",
+                text_color="#165DFF",
+            )
+            self.batch_delete_btn.configure(
+                state="normal",
+                fg_color="#ffffff",
+                hover_color="#ffebee",
+                text_color="#d32f2f",
+            )
+        else:
+            self.batch_redownload_btn.configure(
+                state="disabled",
+                fg_color="#ffffff",
+                hover_color="#ffffff",
+                text_color="#999999",
+                text_color_disabled="#999999",
+            )
+            self.batch_delete_btn.configure(
+                state="disabled",
+                fg_color="#ffffff",
+                hover_color="#ffffff",
+                text_color="#999999",
+                text_color_disabled="#999999",
+            )
+
+    def _after_batch_action_refresh(self):
+        # 批量操作后清空本次处理过的勾选
+        for vid in list(self._selected_ids_all_pages()):
+            self._batch_selected_video_ids.discard(vid)
+        try:
+            self.render_current_page()
+        except Exception:
+            pass
+        self._refresh_batch_action_buttons()
+        self.update_count_display()
+        self.update_button_states()
+
+    def _delete_video_by_id_no_prompt(self, video_id):
+        item = self.download_items.get(video_id)
+        video = (self._video_payload.get(video_id) or (item.video if item else None) or {})
+        if not video:
+            return
+        try:
+            if item and getattr(item, "extractor", None):
+                item.extractor.stop()
+        except Exception:
+            pass
+        self.task_manager.merge_seen_video_ids_batch(self.task_id, [video_id])
+        try:
+            if self._app is not None:
+                self._app._register_seen_video(self.task_id, video_id)
+        except Exception:
+            pass
+        try:
+            self.task_manager.delete_thumbnail(self.task_id, video_id)
+        except Exception:
+            pass
+        try:
+            self.task_manager.delete_video_frames(self.task_id, video.get("title", ""))
+        except Exception:
+            pass
+        try:
+            self.task_manager.update_video_extraction_status(self.task_id, video_id, "已删除", 0, 0)
+        except Exception:
+            pass
+        # 复用原有删除收尾逻辑（清队列、移除缓存、刷新 UI）
+        self.on_delete_item(video_id)
+
+    def batch_redownload_selected(self):
+        ids = self._selected_ids_all_pages()
+        if not ids:
+            messagebox.showinfo(self._tr_local("batch_no_selection_title"), self._tr_local("batch_no_selection_text"))
+            return
+        for vid in ids:
+            try:
+                self.priority_redownload_video(vid)
+            except Exception:
+                pass
+        self._after_batch_action_refresh()
+
+    def batch_delete_selected(self):
+        ids = self._selected_ids_all_pages()
+        if not ids:
+            messagebox.showinfo(self._tr_local("batch_no_selection_title"), self._tr_local("batch_no_selection_text"))
+            return
+        if not messagebox.askyesno(
+            self._tr_local("delete_confirm_title"),
+            self._tr_local("batch_delete_confirm", count=len(ids)),
+            icon="warning",
+        ):
+            return
+        for vid in ids:
+            try:
+                self._delete_video_by_id_no_prompt(vid)
+            except Exception:
+                pass
+        self._after_batch_action_refresh()
 
     def _commit_page_entry(self):
         if getattr(self, "_page_nav_programmatic", False):
@@ -4731,12 +4915,21 @@ class DownloadListFrame(ctk.CTkFrame):
             item = self.instantiate_item_for_worker_if_missing(vid)
             if not item:
                 continue
-            cell = FrameGridCell(self._grid_container, self, vid, title=title, duration=dur)
+            cell = FrameGridCell(
+                self._grid_container,
+                self,
+                vid,
+                title=title,
+                duration=dur,
+                checked=(vid in self._batch_selected_video_ids),
+                on_checked_change=self._set_video_batch_checked,
+            )
             cell.grid(row=r, column=c, padx=3, pady=3, sticky="nsew")
             self._page_cells[vid] = cell
             cell.set_status_text(self._status_text_for_display(item.get_status_text()))
         self._update_page_nav_ui()
         self._thumb_request_visible_page()
+        self._refresh_batch_action_buttons()
 
     def refresh_item_ui(self, video_id):
         cell = self._page_cells.get(video_id)
@@ -5116,6 +5309,8 @@ class DownloadListFrame(ctk.CTkFrame):
         self.add_video_to_queue(video, load_thumbnails=load_thumbnails)
 
     def on_delete_item(self, video_id):
+        self._batch_selected_video_ids.discard(video_id)
+        self._refresh_batch_action_buttons()
         try:
             self.task_manager.merge_seen_video_ids_batch(self.task_id, [video_id])
         except Exception:
@@ -5175,6 +5370,8 @@ class DownloadListFrame(ctk.CTkFrame):
         self.download_items.clear()
         self._video_payload.clear()
         self._video_order.clear()
+        self._batch_selected_video_ids.clear()
+        self._refresh_batch_action_buttons()
         self._current_page = 0
         try:
             for w in self._grid_container.winfo_children():
@@ -5788,9 +5985,22 @@ class EasyDatasetApp(ctk.CTk):
                 df.title_label.configure(text=self.tr("download_list_title"))
                 df.pause_btn.configure(text=self.tr("btn_pause_download"))
                 df.resume_btn.configure(text=self.tr("btn_resume_download"))
+                try:
+                    df.batch_redownload_btn.configure(text=self.tr("btn_batch_redownload"))
+                    df.batch_delete_btn.configure(text=self.tr("btn_batch_delete"))
+                except Exception:
+                    pass
                 w = 140 if self.lang == "en" else 90
                 df.pause_btn.configure(width=w)
                 df.resume_btn.configure(width=w)
+                try:
+                    wb = 96 if self.lang == "en" else 72
+                    wd = 64 if self.lang == "en" else 44
+                    df.batch_redownload_btn.configure(width=wb)
+                    df.batch_delete_btn.configure(width=wd)
+                    df._refresh_batch_action_buttons()
+                except Exception:
+                    pass
                 df._prev_page_btn.configure(text=self.tr("page_prev"))
                 df._next_page_btn.configure(text=self.tr("page_next"))
                 try:
