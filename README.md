@@ -3,8 +3,8 @@
 </div>
 
 <div align="center">
-  <a href="https://huggingface.co/Jonnty/EasyDataset/tree/main" target="_blank">
-    <img src="https://huggingface.co/front/assets/huggingface_logo.svg" alt="Hugging Face" height="24">
+  <a href="https://huggingface.co/Jonnty/EasyDataset/tree/main">
+    <img src="https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Model-blue" alt="Hugging Face Model">
   </a>
 </div>
 
